@@ -26,6 +26,8 @@ import { resolveDesktopPaths } from './paths.ts'
 import { DesktopProjectManager } from './project-manager.ts'
 import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
 import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
+import { DesktopNativeViewport } from './native-viewport.ts'
+import { NATIVE_VIEWPORT_IPC } from './native-viewport-ipc.ts'
 import { installDesktopDirectoryPicker } from './directory-picker.ts'
 import { installMicrophonePermissions } from './microphone-permissions.ts'
 import { DesktopBackendController } from './backend-controller.ts'
@@ -439,6 +441,8 @@ async function main(): Promise<void> {
   }
   const platformView = new DesktopPlatformView(join(app.getAppPath(), 'lib', 'preload-platform-account.cjs'),
     () => locale.id === 'zh-CN' ? 'zh_CN' : 'en_US', process.platform === 'win32' ? 'win32' : 'darwin')
+  // Null bindings off Windows; handlers below still reject acquisitions cleanly.
+  const nativeViewport = await DesktopNativeViewport.load()
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
@@ -740,6 +744,21 @@ async function main(): Promise<void> {
     platformView.setBounds(platformBounds(bounds))
   })
   ipcMain.handle(PLATFORM_IPC.close, (event) => { assertMainApplication(event); platformView.close() })
+  // Native viewport leases: same sender bar as Platform (main frame of the owned application).
+  ipcMain.handle(NATIVE_VIEWPORT_IPC.acquire, (event, bounds: unknown) => {
+    const owner = assertMainApplication(event)
+    return nativeViewport.acquire(owner, platformBounds(bounds))
+  })
+  ipcMain.handle(NATIVE_VIEWPORT_IPC.setBounds, (event, lease: unknown, bounds: unknown) => {
+    assertMainApplication(event)
+    if (typeof lease !== 'string') throw new Error('Invalid native viewport lease')
+    nativeViewport.setBounds(lease, platformBounds(bounds))
+  })
+  ipcMain.handle(NATIVE_VIEWPORT_IPC.release, (event, lease: unknown) => {
+    assertMainApplication(event)
+    if (typeof lease !== 'string') throw new Error('Invalid native viewport lease')
+    nativeViewport.release(lease)
+  })
   // Only the main window may synchronize its palette with the native material.
   ipcMain.on(DESKTOP_IPC.nativeThemeSet, (event, source: unknown) => {
     if (mainWindow === undefined || event.sender !== mainWindow.webContents) return
@@ -1251,6 +1270,7 @@ async function main(): Promise<void> {
     updateSchedule.dispose()
     updateDialog.dispose()
     mandatoryUI?.dispose()
+    nativeViewport.dispose()
     void Promise.all([Promise.resolve(mandatoryPolicy?.dispose()).then(() => policyAuth?.dispose()), backend.close(),
       // A Platform cleanup failure is logged without cutting the remaining Host shutdown short.
       platformView.dispose().catch((error: unknown) => { console.error(error) })])
@@ -1261,10 +1281,11 @@ async function main(): Promise<void> {
       shuttingDown = true
       quitConfirmation.dispose()
       backgroundNotice?.dispose()
-      updateJournal?.action('quit-requested')
       tray?.dispose()
+      updateJournal?.action('quit-requested')
       updateDialog.dispose()
       mandatoryUI?.dispose()
+      nativeViewport.dispose()
       // Installation preparation already awaited Platform storage cleanup.
       void platformView.dispose().catch((error: unknown) => { console.error(error) })
       return
